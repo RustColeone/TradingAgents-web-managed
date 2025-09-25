@@ -1,0 +1,767 @@
+/* Bright theme stylesheet - replacing corrupted content */
+:root {
+    /* Bright theme palette */
+    --bg: #f5f7fb;
+    --card: #ffffff;
+    --text: #0f172a;
+    --muted: #475569;
+    --border: #d1d5db;
+    --accent: #2563eb;
+    --buy: #065f46;
+    --hold: #334155;
+    --sell: #7f1d1d;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    font-family: system-ui, Segoe UI, Inter, Roboto, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+}
+
+/* Header */
+header {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: linear-gradient(180deg, rgba(248, 250, 252, .98), rgba(248, 250, 252, .94));
+    border-bottom: 1px solid var(--border);
+}
+
+.bar {
+    max-width: 1100px;
+    margin: auto;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 16px;
+    align-items: center;
+    padding: 14px 16px;
+}
+
+.brandWrap {
+    min-width: 0;
+}
+
+.brand {
+    font-weight: 800;
+    letter-spacing: .2px;
+    font-size: 20px;
+    line-height: 1.1;
+}
+
+.sub {
+    margin-top: 4px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.2;
+}
+
+.headActions {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+}
+
+.searchWrap {
+    min-width: 360px;
+    flex: 1;
+}
+
+/* Chips & badges */
+.pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 6px 10px;
+    font-size: 12px;
+    background: #f8fafc;
+    color: var(--muted);
+}
+
+.badge {
+    border: 1px solid #c7d2fe;
+    border-radius: 999px;
+    padding: 2px 8px;
+    font-size: 12px;
+    background: #eef2ff;
+    color: #1f2937;
+}
+
+.tickerpill {
+    display: inline-block;
+    background: #f8fafc;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 8px;
+    margin: 2px 6px 2px 0;
+    font-size: 12px;
+}
+
+/* Forms */
+input,
+textarea {
+    background: #f8fafc;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 8px 10px;
+    border-radius: 10px;
+    width: 100%;
+}
+
+textarea {
+    min-height: 100px;
+    resize: vertical;
+}
+
+button {
+    background: #eef2ff;
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 8px 12px;
+    border-radius: 10px;
+    cursor: pointer;
+}
+
+button.primary {
+    background: var(--accent);
+    color: #ffffff;
+    border-color: #1e40af;
+}
+
+button.danger {
+    background: #fee2e2;
+    border-color: #fecaca;
+    color: #7f1d1d;
+}
+
+button.ghost {
+    background: #f8fafc;
+    color: var(--text);
+    border-color: var(--border);
+}
+
+/* Page */
+main {
+    max-width: 1100px;
+    margin: 16px auto;
+    padding: 0 16px;
+}
+
+.muted {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+/* Table feed */
+.feed {
+    display: block;
+}
+
+.table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    overflow: hidden;
+}
+
+.table thead th {
+    position: static;
+    top: auto;
+    background: #f1f5f9;
+    text-align: left;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    font-weight: 600;
+}
+
+.table tbody td {
+    padding: 12px 14px;
+    border-top: 1px solid var(--border);
+    vertical-align: top;
+}
+
+/* Drag & drop reordering */
+.drag-cell {
+    width: 24px;
+    padding-left: 8px;
+    padding-right: 4px;
+}
+.drag-handle {
+    cursor: grab;
+    user-select: none;
+    color: #94a3b8;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+tr.dragging .drag-handle {
+    cursor: grabbing;
+}
+tr.dragging {
+    opacity: 0.6;
+}
+tbody tr.drag-over {
+    outline: 2px dashed #93c5fd;
+    outline-offset: -2px;
+}
+/* More precise drop position indicators */
+tbody tr.drop-before {
+    box-shadow: inset 0 3px 0 0 #60a5fa;
+}
+tbody tr.drop-after {
+    box-shadow: inset 0 -3px 0 0 #60a5fa;
+}
+
+/* Custom drag ghost */
+.drag-ghost {
+    position: fixed;
+    top: 0; left: 0;
+    pointer-events: none;
+    background: #eef2ff;
+    color: #111827;
+    border: 1px solid #c7d2fe;
+    border-radius: 10px;
+    padding: 6px 10px;
+    font-size: 12px;
+    box-shadow: 0 8px 16px rgba(0,0,0,.2);
+    z-index: 99999;
+}
+
+/* Accent borders for suggestions */
+.rowAccent {
+    border-left: 6px solid transparent;
+}
+
+.rowAccent.buy {
+    border-left-color: var(--buy);
+    box-shadow: inset 0 0 0 1px rgba(6, 95, 70, .15);
+}
+
+.rowAccent.hold {
+    border-left-color: var(--hold);
+    box-shadow: inset 0 0 0 1px rgba(51, 65, 85, .15);
+}
+
+.rowAccent.sell {
+    border-left-color: var(--sell);
+    box-shadow: inset 0 0 0 1px rgba(127, 29, 29, .15);
+}
+
+.suggestion.buy {
+    color: #065f46;
+}
+
+.suggestion.hold {
+    color: #1f2937;
+}
+
+.suggestion.sell {
+    color: #7f1d1d;
+}
+
+/* Dialogs */
+dialog {
+    border: none;
+    border-radius: 18px;
+    max-width: 960px;
+    width: min(92vw, 960px);
+    padding: 0;
+    overflow: hidden;
+    box-shadow: 0 16px 44px rgba(0, 0, 0, .25);
+}
+
+dialog::backdrop {
+    background: rgba(0, 0, 0, .35);
+}
+
+.modal {
+    background: var(--card);
+    color: var(--text);
+}
+
+.modal header {
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+    background: #f8fafc;
+}
+
+.modal .content {
+    padding: 16px;
+    display: grid;
+    gap: 14px;
+    max-height: min(72vh, 780px);
+    overflow: auto;
+}
+
+/* Generic inline row helper */
+.inline {
+    display: inline-flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+/* Report area scrollbars (bigger and light) */
+pre.log {
+    background: #f8fafc;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 10px;
+    max-height: 60vh;
+    overflow: auto;
+    resize: vertical;
+    scrollbar-color: #94a3b8 #e5e7eb;
+    scrollbar-width: auto;
+    scrollbar-gutter: stable both-edges;
+    padding-right: 6px;
+}
+
+pre.log::-webkit-scrollbar {
+    width: 18px;
+    height: 18px;
+}
+
+pre.log::-webkit-scrollbar-thumb {
+    background: #94a3b8;
+    border-radius: 10px;
+    border: 3px solid #e5e7eb;
+}
+
+pre.log::-webkit-scrollbar-thumb:hover {
+    background: #64748b;
+}
+
+pre.log::-webkit-scrollbar-track {
+    background: #e5e7eb;
+}
+
+pre.log::-webkit-scrollbar-corner {
+    background: #e5e7eb;
+}
+
+/* Bright pre card for summary */
+.pre-card {
+    background: #f8fafc;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 10px;
+}
+
+/* Dialog footer actions */
+.actions {
+    display: flex;
+    gap: 10px;
+    justify-content: flex-end;
+    padding: 12px 16px;
+    border-top: 1px solid var(--border);
+    background: #f8fafc;
+}
+
+/* Chart */
+.chartWrap {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 10px;
+    background: #f8fafc;
+    margin-top: 8px;
+}
+
+.chartHead {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+}
+
+.chartHead select {
+    background: #f8fafc;
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 6px 8px;
+    border-radius: 10px;
+    font-size: 12px;
+}
+
+canvas {
+    width: 100%;
+    height: 240px;
+}
+
+.chartCanvasWrap {
+    position: relative;
+    overflow-x: hidden;
+}
+
+.ctrl {
+    position: absolute;
+    display: flex;
+    gap: 6px;
+    opacity: .5;
+}
+
+.ctrl button {
+    padding: 6px 8px;
+}
+
+.ctrl-top-left {
+    top: 8px;
+    left: 48px;
+}
+
+.ctrl-mid-left {
+    top: 50%;
+    left: 48px;
+    transform: translateY(-50%);
+}
+
+.ctrl-mid-right {
+    top: 50%;
+    right: 8px;
+    transform: translateY(-50%);
+}
+
+.chartFooter {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 8px;
+}
+
+.chartFooter .footerControls {
+    display: flex;
+    gap: 8px;
+}
+
+.chartFooter select {
+    background: #f8fafc;
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 6px 8px;
+    border-radius: 10px;
+    font-size: 12px;
+}
+
+/* Detail dialog: snapshot table width control */
+.modal .content #dSnapshot .table {
+    table-layout: fixed;
+    width: 100%;
+}
+
+.modal .content #dSnapshot .table th,
+.modal .content #dSnapshot .table td {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.modal .content #dSnapshot .table thead th:nth-child(1),
+.modal .content #dSnapshot .table tbody td:nth-child(1) {
+    width: 28%;
+}
+
+.modal .content #dSnapshot .table thead th:nth-child(2),
+.modal .content #dSnapshot .table tbody td:nth-child(2) {
+    width: 18%;
+    text-align: right;
+}
+
+.modal .content #dSnapshot .table thead th:nth-child(3),
+.modal .content #dSnapshot .table tbody td:nth-child(3) {
+    width: 18%;
+    text-align: right;
+}
+
+.modal .content #dSnapshot .table thead th:nth-child(4),
+.modal .content #dSnapshot .table tbody td:nth-child(4) {
+    width: 16%;
+    text-align: right;
+}
+
+.modal .content #dSnapshot .table thead th:nth-child(5),
+.modal .content #dSnapshot .table tbody td:nth-child(5) {
+    width: 20%;
+}
+
+.modal .content #dSnapshot .badge.suggestion {
+    white-space: nowrap;
+    display: inline-block;
+    font-size: 12px;
+    padding: 2px 8px;
+}
+
+/* Floating + button (FAB) */
+.fab {
+    position: fixed;
+    right: 24px;
+    bottom: 24px;
+    width: 56px;
+    height: 56px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 28px;
+    font-weight: 700;
+    background: var(--accent);
+    color: #ffffff;
+    border: 0;
+    box-shadow: 0 12px 24px rgba(0, 0, 0, .25);
+}
+
+.fab:hover {
+    transform: translateY(-1px);
+}
+
+.fab:active {
+    transform: translateY(0);
+}
+
+/* Toast */
+.toast {
+    position: fixed;
+    left: 50%;
+    bottom: 24px;
+    transform: translateX(-50%) translateY(12px);
+    background: #0f172a;
+    color: #ffffff;
+    padding: 10px 14px;
+    border-radius: 10px;
+    border: 1px solid #1f2937;
+    box-shadow: 0 10px 24px rgba(0,0,0,.25);
+    opacity: 0;
+    transition: opacity .18s ease, transform .18s ease;
+    z-index: 9999;
+}
+.toast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+}
+
+/* Forms layout */
+.rowgrid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+}
+
+.row {
+    display: grid;
+    gap: 6px;
+}
+
+/* Responsive */
+@media (max-width: 880px) {
+    .bar {
+        grid-template-columns: 1fr;
+    }
+
+    .headActions {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .searchWrap {
+        min-width: 0;
+    }
+}
+
+/* Extra small screens */
+@media (max-width: 640px) {
+
+    .table thead th,
+    .table tbody td {
+        padding: 8px 10px;
+        font-size: 12px;
+    }
+
+    .tickerpill {
+        font-size: 11px;
+        padding: 2px 6px;
+    }
+
+    .badge {
+        font-size: 11px;
+        padding: 2px 6px;
+    }
+
+    /* Hide purchase and current price columns in feed table (account for handle column) */
+    .feed .table thead th:nth-child(4),
+    .feed .table thead th:nth-child(5),
+    .feed .table tbody td:nth-child(4),
+    .feed .table tbody td:nth-child(5),
+    #feed .table thead th:nth-child(4),
+    #feed .table thead th:nth-child(5),
+    #feed .table tbody td:nth-child(4),
+    #feed .table tbody td:nth-child(5) {
+        display: none;
+    }
+
+    /* Compact dialog */
+    .modal .content {
+        max-height: 68vh;
+        padding: 12px;
+        gap: 10px;
+    }
+
+    header .inline button {
+        padding: 6px 8px;
+        font-size: 12px;
+    }
+
+    /* Keep actions on one row */
+    .actions {
+        flex-wrap: nowrap;
+        gap: 6px;
+    }
+
+    .actions button {
+        flex: 0 1 auto;
+        min-width: 0;
+        padding: 6px 8px;
+        font-size: 12px;
+    }
+
+    /* Chart tweaks */
+    canvas {
+        height: 200px;
+    }
+
+    .chartWrap {
+        padding: 8px;
+    }
+
+    .chartHead select {
+        padding: 4px 6px;
+        font-size: 11px;
+    }
+
+    .chartFooter select {
+        padding: 4px 6px;
+        font-size: 11px;
+    }
+
+    .ctrl button {
+        padding: 4px 6px;
+    }
+
+    /* Smaller pre & tables */
+    .modal .content pre {
+        font-size: 11.5px;
+        line-height: 1.45;
+        word-break: break-word;
+        overflow-wrap: anywhere;
+    }
+
+    .modal .content table {
+        font-size: 12px;
+        table-layout: fixed;
+        width: 100%;
+    }
+
+    .modal .content table th,
+    .modal .content table td {
+        word-wrap: break-word;
+        white-space: normal;
+    }
+
+    .modal .content .table thead th,
+    .modal .content .table tbody td {
+        padding: 8px 10px;
+    }
+
+    .table thead th:nth-child(2) {
+        width: 32% !important;
+    }
+
+    .table thead th:nth-child(3) {
+        width: 28% !important;
+    }
+
+    .table thead th:nth-child(6) {
+        width: 22% !important;
+    }
+
+    .table thead th:nth-child(7) {
+        width: 18% !important;
+    }
+}
+
+/* Very small screens */
+@media (max-width: 480px) {
+
+    .modal .content #dSnapshot .table thead th:nth-child(1),
+    .modal .content #dSnapshot .table tbody td:nth-child(1) {
+        width: 32%;
+    }
+
+    .modal .content #dSnapshot .table thead th:nth-child(2),
+    .modal .content #dSnapshot .table tbody td:nth-child(2) {
+        width: 16%;
+    }
+
+    .modal .content #dSnapshot .table thead th:nth-child(3),
+    .modal .content #dSnapshot .table tbody td:nth-child(3) {
+        width: 16%;
+    }
+
+    .modal .content #dSnapshot .table thead th:nth-child(4),
+    .modal .content #dSnapshot .table tbody td:nth-child(4) {
+        width: 14%;
+    }
+
+    .modal .content #dSnapshot .table thead th:nth-child(5),
+    .modal .content #dSnapshot .table tbody td:nth-child(5) {
+        width: 22%;
+    }
+
+    .modal .content #dSnapshot .badge.suggestion {
+        font-size: 11px;
+        padding: 2px 6px;
+    }
+}
+
+@media (max-width: 360px) {
+    dialog {
+        width: 98vw;
+    }
+
+    .modal header {
+        padding: 10px 12px;
+    }
+
+    .modal .content {
+        padding: 8px 10px;
+        gap: 8px;
+        max-height: 70vh;
+    }
+
+    .actions {
+        padding: 8px 10px;
+        gap: 6px;
+    }
+
+    .actions button {
+        padding: 5px 8px;
+        font-size: 11px;
+    }
+
+    /* Slightly more space for Suggestion */
+    .modal .content #dSnapshot .table thead th:nth-child(1),
+    .modal .content #dSnapshot .table tbody td:nth-child(1) {
+        width: 34%;
+    }
+
+    .modal .content #dSnapshot .table thead th:nth-child(5),
+    .modal .content #dSnapshot .table tbody td:nth-child(5) {
+        width: 24%;
+    }
+}

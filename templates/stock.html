@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>📈 TradingAgents Watch</title>
+    <script>
+        // Dynamically load CSS from /static when served, or from ../static when opened standalone
+        (function(){
+            var hasServer = location.protocol === 'http:' || location.protocol === 'https:';
+            var STATIC_BASE = hasServer ? '/static/' : '../static/';
+            var l = document.createElement('link');
+            l.rel = 'stylesheet';
+            l.href = STATIC_BASE + 'app.css';
+            document.head.appendChild(l);
+        })();
+    </script>
+</head>
+
+<body>
+    <header>
+        <div class="bar">
+            <div class="brandWrap">
+                <div class="brand">📈 TradingAgents Watch</div>
+                <div class="sub">Post baskets of tickers, auto-analyze with TradingAgents, and review daily</div>
+            </div>
+            <div class="headActions">
+                <div class="searchWrap">
+                    <input id="searchBox" type="text" placeholder="Search title / tickers / description…" />
+                </div>
+                <div class="btnRow">
+                    <span class="pill" id="serverState">…</span>
+                    <button id="runAllBtn" class="ghost">Run All Analyses</button>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main>
+        <section id="feed" class="feed"></section>
+    </main>
+
+    <!-- Floating Action Button (+) -->
+    <button id="fabAdd" class="fab" title="New Post" aria-label="New Post">+</button>
+
+    <dialog id="postDlg">
+        <div class="modal">
+            <header><strong id="dlgTitle">New Post</strong></header>
+            <div class="content">
+                <div class="rowgrid">
+                    <div class="row">
+                        <label>Title</label>
+                        <input id="pTitle" type="text" placeholder="e.g., Tech Growth Basket" />
+                    </div>
+                    <div class="row">
+                        <label>Tickers (comma-separated)</label>
+                        <input id="pTickers" type="text" placeholder="AAPL, MSFT, NVDA" />
+                    </div>
+                </div>
+                <div class="row">
+                    <label>Description</label>
+                    <textarea id="pDesc" placeholder="Notes / thesis for this basket"></textarea>
+                </div>
+                <div class="row">
+                    <label>Purchase Prices (optional)</label>
+                    <div class="muted">Add per-ticker prices like <code>AAPL=182.50, MSFT=410</code> — leave blank if
+                        unknown.</div>
+                    <input id="pPurchases" type="text" placeholder="AAPL=182.50, MSFT=410" />
+                </div>
+                <div class="row">
+                    <label>TradingAgents Options (JSON)</label>
+                    <textarea id="pOptions" placeholder='{"indicators":["rsi","macd"],"window":90}'></textarea>
+                </div>
+            </div>
+            <div class="actions">
+                <button class="ghost" id="cancelDlg">Cancel</button>
+                <button id="saveDlg" class="primary">Save</button>
+            </div>
+        </div>
+    </dialog>
+
+    <dialog id="detailDlg">
+        <div class="modal">
+            <header style="display:flex;align-items:center;gap:10px;justify-content:space-between">
+                <strong id="dTitle">Post</strong>
+                <button id="dClose" class="ghost" title="Close" aria-label="Close" style="font-weight:700">×</button>
+            </header>
+            <div class="content" id="dContent"></div>
+            <div class="actions">
+                <button id="dEdit">Edit</button>
+                <button id="dDelete" class="danger">Delete</button>
+                <button id="dAnalyze" class="primary">Analyze</button>
+            </div>
+        </div>
+    </dialog>
+
+    <script>
+        (function(){
+            var hasServer = location.protocol === 'http:' || location.protocol === 'https:';
+            var STATIC_BASE = hasServer ? '/static/' : '../static/';
+            var s = document.createElement('script');
+            s.src = STATIC_BASE + 'app.js';
+            document.body.appendChild(s);
+        })();
+    </script>
+</body>
+
+</html>
