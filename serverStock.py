@@ -38,6 +38,96 @@ DAILY_REGEN_MIN = 10
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
 # -------------------
+# Job queue (in-memory)
+# -------------------
+JOB_LOCK = threading.RLock()
+JOB_QUEUE: List[str] = []  # list of post ids
+JOB_STATE: Dict[str, str] = {}  # pid -> 'idle'|'queued'|'running'|'done'|'error'|'stopped'
+CURRENT_JOB: Dict[str, Any] = {"pid": None}  # mutable holder
+STOP_FLAGS: Dict[str, threading.Event] = {}  # pid -> Event
+QUEUE_EVENTS: List[Dict[str, Any]] = []  # pending SSE events
+QUEUE_CV = threading.Condition(JOB_LOCK)
+TERMINAL_STATES = {"done", "error", "stopped"}
+
+# -------------------
+# Chroma memory collection collision patch
+# -------------------
+_MEMORY_PATCHED = False
+
+def _patch_financial_memory():
+    """Monkey-patch FinancialSituationMemory.__init__ so repeated instantiation
+    does not raise 'Collection [name] already exists'. We do NOT edit the original
+    tradingagents package on disk per user request.
+
+    Strategy:
+      1. Try create_collection (original behavior).
+      2. On failure, fall back to get_collection.
+      3. If get_collection also fails (e.g., dangling metadata), attempt delete + recreate.
+    """
+    global _MEMORY_PATCHED
+    if _MEMORY_PATCHED:
+        return
+    try:  # Import inside to avoid hard dependency if tradingagents not installed
+        from tradingagents.agents.utils.memory import FinancialSituationMemory
+        from tradingagents.agents.utils.embedding_provider_factory import EmbeddingProviderFactory
+        import chromadb
+        from chromadb.config import Settings
+    except Exception:
+        return  # tradingagents or chromadb missing; nothing to patch
+
+    if getattr(FinancialSituationMemory.__init__, '_patched', False):
+        _MEMORY_PATCHED = True
+        return
+
+    orig_init = FinancialSituationMemory.__init__
+
+    def patched_init(self, name, config):  # type: ignore
+        self.config = config
+        try:
+            self.backend_url = config["backend_url"]
+        except Exception:
+            self.backend_url = ''
+        # Reuse embedding provider factory
+        try:
+            self.embedding_provider = EmbeddingProviderFactory.create_provider(config)
+        except Exception:
+            # Fallback: defer to original init if embedding provider fails
+            return orig_init(self, name, config)  # type: ignore
+        try:
+            self.chroma_client = chromadb.Client(Settings(allow_reset=True))
+        except Exception as e:
+            print(f"[memory-patch] Failed to init Chroma client: {e}")
+            return orig_init(self, name, config)  # type: ignore
+        # Attempt create -> get -> delete+create
+        try:
+            self.situation_collection = self.chroma_client.create_collection(name=name)
+        except Exception as ce:
+            try:
+                self.situation_collection = self.chroma_client.get_collection(name=name)
+                print(f"[memory-patch] Reused existing Chroma collection '{name}'.")
+            except Exception:
+                # Last resort: delete then recreate (may fail silently if delete invalid)
+                try:
+                    self.chroma_client.delete_collection(name)
+                except Exception:
+                    pass
+                try:
+                    self.situation_collection = self.chroma_client.create_collection(name=name)
+                    print(f"[memory-patch] Deleted & recreated Chroma collection '{name}'.")
+                except Exception as ce2:
+                    print(f"[memory-patch] Failed to create/recreate collection '{name}': {ce2}")
+                    # Surface original behavior by delegating to original init (may raise)
+                    return orig_init(self, name, config)  # type: ignore
+
+    patched_init._patched = True  # type: ignore
+    FinancialSituationMemory.__init__ = patched_init  # type: ignore
+    _MEMORY_PATCHED = True
+    print("[memory-patch] FinancialSituationMemory patched to tolerate existing collections.")
+
+# Apply patch ASAP so any later imports/instantiations use the tolerant behavior
+_patch_financial_memory()
+
+# -------------------
 # Data helpers
 # -------------------
 def _read() -> List[Dict[str, Any]]:
@@ -74,6 +164,55 @@ def _update_post(pid: str, mutator):
         mutator(p)
         _write(posts)
         return True
+
+def _get_job_states() -> Dict[str, Any]:
+    with JOB_LOCK:
+        running = CURRENT_JOB.get("pid")
+        queue = list(JOB_QUEUE)
+        states = dict(JOB_STATE)
+        # Ensure all queued/running have at least a state value
+        if running and states.get(running) != 'running':
+            states[running] = 'running'
+        for q in queue:
+            if states.get(q) not in ('queued','running'):
+                states[q] = 'queued'
+        return {"running": running, "queue": queue, "states": states}
+
+def _set_state(pid: str, state: str):
+    with JOB_LOCK:
+        JOB_STATE[pid] = state
+        if state in ('done', 'error', 'stopped'):
+            # clear stop flag once finished
+            ev = STOP_FLAGS.get(pid)
+            if ev: ev.clear()
+        # Emit event only for terminal states to reduce chatter
+        if state in TERMINAL_STATES:
+            evt = {"type": "state", "pid": pid, "state": state}
+            QUEUE_EVENTS.append(evt)
+            QUEUE_CV.notify_all()
+
+def _build_queue_status_payload() -> Dict[str, Any]:
+    data = _get_job_states()
+    try:
+        posts = _read()
+        prim = {}
+        for p in posts:
+            pid = str(p.get("id"))
+            tickers = p.get("tickers") or []
+            if not tickers:
+                continue
+            primary = tickers[0]
+            ana = p.get("analysis") or {}
+            per = (ana.get("per_ticker") or {})
+            rec = per.get(primary) or {}
+            sug = rec.get("suggestion")
+            if sug:
+                prim[pid] = {"ticker": primary, "suggestion": sug}
+        if prim:
+            data["primary_suggestions"] = prim
+    except Exception:
+        pass
+    return data
 
 # -------------------
 # TradingAgents adapter
@@ -240,6 +379,183 @@ def row_suggestion(analysis: Dict[str, Any], primary: str) -> str:
     return rec.get("suggestion", "Hold")
 
 # -------------------
+# Analysis execution (non-streaming) honoring STOP flags
+# -------------------
+def perform_analysis(pid: str) -> None:
+    posts = _read()
+    p = _find(posts, pid)
+    if not p:
+        _set_state(pid, 'error')
+        return
+    tickers = p.get("tickers") or []
+    opts = p.get("options") or {}
+
+    def init_analysis(pp):
+        ana = pp.get("analysis") or {}
+        if not isinstance(ana, dict):
+            ana = {}
+        if "report" not in ana:
+            ana["report"] = ""
+        if "per_ticker" not in ana:
+            ana["per_ticker"] = {}
+        ana["updatedAt"] = _utcnow_iso()
+        pp["analysis"] = ana
+
+    def log_line(msg):
+        wrapped = _wrap_text(msg)
+        def m(pp):
+            init_analysis(pp)
+            rep = pp["analysis"].get("report", "")
+            pp["analysis"]["report"] = rep + ("\n" if rep else "") + wrapped
+            pp["analysis"]["updatedAt"] = _utcnow_iso()
+        _update_post(pid, m)
+
+    try:
+        from tradingagents.graph.trading_graph import TradingAgentsGraph
+        from tradingagents.default_config import DEFAULT_CONFIG
+    except Exception as e:
+        log_line(f"ERROR: {e}")
+        _set_state(pid, 'error')
+        return
+
+    try:
+        cfg = DEFAULT_CONFIG.copy()
+    except Exception:
+        cfg = {}
+    for k in ["llm_provider", "deep_think_llm", "quick_think_llm", "backend_url", "online_tools", "max_debate_rounds", "project_dir"]:
+        if k in opts: cfg[k] = opts[k]
+    if isinstance(opts.get("config"), dict):
+        cfg.update(opts["config"])
+    selected_analysts = opts.get("selected_analysts") or ["market", "social", "news", "fundamentals"]
+    debug = bool(opts.get("debug", False))
+    date_str = (opts.get("date") or datetime.now(APP_TZ).date().isoformat())
+
+    # Prepare isolated base dir
+    try:
+        base_run_dir = os.path.join(DATA_DIR, ".ta_runs", str(pid))
+        os.makedirs(base_run_dir, exist_ok=True)
+    except Exception:
+        base_run_dir = None
+    if "project_dir" not in cfg and base_run_dir:
+        cfg["project_dir"] = os.path.join(base_run_dir, "base")
+
+    stop_ev = STOP_FLAGS.setdefault(pid, threading.Event())
+
+    def derive_decision(text: str) -> str | None:
+        try:
+            txt = (text or "").lower()
+            if not txt: return None
+            if "final" in txt or "proposal" in txt or "decision" in txt:
+                if "buy" in txt: return "Buy"
+                if "sell" in txt: return "Sell"
+                if "hold" in txt: return "Hold"
+            if "buy" in txt: return "Buy"
+            if "sell" in txt: return "Sell"
+            if "hold" in txt: return "Hold"
+            return None
+        except Exception:
+            return None
+
+    for t in tickers:
+        if stop_ev.is_set():
+            _set_state(pid, 'stopped')
+            return
+        attempt = 1
+        local_cfg = dict(cfg)
+        while attempt <= 2:
+            try:
+                if attempt > 1 and base_run_dir:
+                    run_ns = os.path.join(base_run_dir, t)
+                    try:
+                        os.makedirs(run_ns, exist_ok=True)
+                        local_cfg = dict(local_cfg)
+                        local_cfg["project_dir"] = os.path.join(run_ns, f"run-{int(time.time())}")
+                        os.makedirs(local_cfg["project_dir"], exist_ok=True)
+                    except Exception:
+                        pass
+                ta = TradingAgentsGraph(selected_analysts=selected_analysts, debug=debug, config=local_cfg)
+                init_state = ta.propagator.create_initial_state(t, date_str)
+                args = ta.propagator.get_graph_args()
+                final_state = None
+                last_decision_seen = None
+                for chunk in ta.graph.stream(init_state, **args):
+                    if stop_ev.is_set():
+                        _set_state(pid, 'stopped')
+                        return
+                    if not chunk.get("messages"): continue
+                    message = chunk["messages"][-1]
+                    content = getattr(message, "content", None)
+                    if content and str(content).strip():
+                        text = str(content).strip()
+                        log_line(f"{t}: {text}")
+                        d = derive_decision(text)
+                        if d: last_decision_seen = d
+                    final_state = chunk
+                if not final_state:
+                    raise RuntimeError("No final state produced by graph.stream")
+                decision = None
+                if final_state and final_state.get("final_trade_decision"):
+                    try:
+                        decision = ta.process_signal(final_state["final_trade_decision"]) or ""
+                    except Exception:
+                        decision = str(final_state.get("final_trade_decision") or "")
+                if not decision:
+                    decision = last_decision_seen or "Hold"
+                norm = ("Buy" if "buy" in str(decision).lower() else "Sell" if "sell" in str(decision).lower() else "Hold")
+                signals = {
+                    "final_trade_decision": final_state.get("final_trade_decision"),
+                    "investment_plan": final_state.get("investment_plan"),
+                    "judge_decision_invest": (final_state.get("investment_debate_state") or {}).get("judge_decision"),
+                    "judge_decision_risk": (final_state.get("risk_debate_state") or {}).get("judge_decision"),
+                }
+                def upd(pp):
+                    init_analysis(pp)
+                    per = pp["analysis"].setdefault("per_ticker", {})
+                    per[t] = {"suggestion": norm, "signals": signals}
+                    pp["analysis"]["updatedAt"] = _utcnow_iso()
+                _update_post(pid, upd)
+                # Snapshot
+                cur = get_latest_price(t)
+                buy = None
+                if isinstance(p.get("purchases"), dict): buy = (p.get("purchases") or {}).get(t)
+                elif isinstance(p.get("purchases"), (int, float)): buy = p.get("purchases")
+                pct = percent_change(buy, cur) if buy is not None else None
+                def upd_snap(pp):
+                    pp.setdefault("snapshot", {})[t] = {"current": cur, "pct": pct}
+                    pp["updatedAt"] = _utcnow_iso()
+                _update_post(pid, upd_snap)
+                break
+            except Exception as e:
+                msg = str(e)
+                if ("already exists" in msg and "memory" in msg.lower()) and attempt == 1:
+                    log_line(f"{t}: warning Memory collection already exists; retrying with a fresh memory namespace.")
+                    attempt += 1
+                    continue
+                log_line(f"{t}: error {e}")
+                def upd_err(pp):
+                    init_analysis(pp)
+                    per = pp["analysis"].setdefault("per_ticker", {})
+                    per[t] = {"suggestion": per.get(t, {}).get("suggestion", "Hold"), "signals": {"error": str(e)}}
+                    pp["analysis"]["updatedAt"] = _utcnow_iso()
+                _update_post(pid, upd_err)
+                break
+
+    # Final summary
+    posts_now = _read()
+    p_now = _find(posts_now, pid)
+    per = (p_now.get("analysis") or {}).get("per_ticker") or {}
+    lines = []
+    for tk in tickers:
+        v = per.get(tk) or {}
+        lines.append(f"{tk}: {v.get('suggestion','')} ({opts.get('date') or datetime.now(APP_TZ).date().isoformat()})")
+    def set_summary(pp):
+        init_analysis(pp)
+        pp["analysis"]["summary"] = "\n".join(lines)
+        pp["analysis"]["updatedAt"] = _utcnow_iso()
+        pp["updatedAt"] = _utcnow_iso()
+    _update_post(pid, set_summary)
+
+# -------------------
 # API
 # -------------------
 @app.get("/api/config")
@@ -249,6 +565,14 @@ def api_config():
 @app.get("/api/stocks")
 def list_posts():
     return jsonify(_read())
+
+@app.get("/api/stocks/<pid>")
+def get_post(pid):
+    posts = _read()
+    p = _find(posts, pid)
+    if not p:
+        return jsonify({"message": "Not found"}), 404
+    return jsonify(p)
 
 @app.post("/api/stocks/reorder")
 def reorder_posts():
@@ -427,6 +751,109 @@ def analyze_post(pid):
     _write(posts)
     return jsonify(p)
 
+@app.post("/api/queue/<pid>")
+def enqueue_post(pid):
+    # Enqueue a post for analysis; if running or already queued, return current status
+    posts = _read()
+    p = _find(posts, pid)
+    if not p:
+        return jsonify({"message": "Not found"}), 404
+    with JOB_LOCK:
+        newly_added = False
+        if pid == CURRENT_JOB.get("pid"):
+            JOB_STATE[pid] = 'running'
+        elif pid in JOB_QUEUE:
+            JOB_STATE[pid] = 'queued'
+        else:
+            JOB_QUEUE.append(pid)
+            # If previously terminal state (done/error/stopped), reset to queued
+            JOB_STATE[pid] = 'queued'
+            newly_added = True
+    # Clear "done" marker if re-queued: remove final state so UI won't show stale done
+    st = JOB_STATE.get(pid)
+    if st == 'queued':
+        try:
+            def _prep(pp):
+                ana = pp.get("analysis") or {}
+                if isinstance(ana, dict):
+                    # Keep existing per_ticker suggestions (so user sees last known) but remove summary marker if desired.
+                    # Do not wipe per_ticker; UI will update progressively.
+                    ana.setdefault("per_ticker", {})
+                    # If this is a fresh enqueue (was not previously queued/running), clear the report immediately
+                    if newly_added:
+                        ana["report"] = ""
+                        # Optional: could also clear summary; leaving summary intact until new one generated
+                    pp["analysis"] = ana
+            _update_post(pid, _prep)
+        except Exception:
+            pass
+    return jsonify(_get_job_states())
+
+@app.post("/api/queue/stop/<pid>")
+def stop_post(pid):
+    # If queued: remove from queue; If running: signal stop
+    with JOB_LOCK:
+        if pid in JOB_QUEUE:
+            JOB_QUEUE[:] = [x for x in JOB_QUEUE if x != pid]
+            JOB_STATE[pid] = 'stopped'
+            return jsonify(_get_job_states())
+        if pid == CURRENT_JOB.get("pid"):
+            ev = STOP_FLAGS.setdefault(pid, threading.Event())
+            ev.set()
+            JOB_STATE[pid] = 'stopped'
+            return jsonify(_get_job_states())
+    return jsonify(_get_job_states())
+
+@app.get("/api/queue/status")
+def queue_status():
+    # Retained for manual fetch / legacy; full payload build
+    return jsonify(_build_queue_status_payload())
+
+@app.get("/api/queue/stream")
+def queue_stream():
+    """SSE stream for queue terminal state changes only.
+    Emits: {type: 'state', pid, state} for done/error/stopped
+    Client should do a one-time GET /api/queue/status when dialog/feed opens, then listen here.
+    """
+    def gen():
+        # Initial comment to open stream
+        yield ":ok\n\n"
+        while True:
+            with QUEUE_CV:
+                if not QUEUE_EVENTS:
+                    QUEUE_CV.wait(timeout=25)
+                events = list(QUEUE_EVENTS)
+                QUEUE_EVENTS.clear()
+            for evt in events:
+                try:
+                    yield _sse(evt)
+                except Exception:
+                    continue
+            # Send a keep-alive comment every ~25s to keep connection open
+            if not events:
+                yield ":keep-alive\n\n"
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "Content-Type": "text/event-stream",
+    }
+    return Response(stream_with_context(gen()), headers=headers)
+
+@app.get("/api/suggestions")
+def suggestions():
+    """Lightweight suggestions fetch: {post_id: {ticker: suggestion, ...}}"""
+    out: Dict[str, Dict[str,str]] = {}
+    try:
+        posts = _read()
+        for p in posts:
+            pid = str(p.get("id"))
+            per = (p.get("analysis") or {}).get("per_ticker") or {}
+            if per:
+                out[pid] = {tk: (per.get(tk) or {}).get("suggestion") for tk in per.keys()}
+    except Exception:
+        pass
+    return jsonify(out)
+
 @app.get("/api/refresh-snapshot/<pid>")
 def refresh_snapshot(pid):
     """
@@ -527,110 +954,146 @@ def analyze_post_stream(pid):
                 pp["analysis"]["updatedAt"] = _utcnow_iso()
             _update_post(pid, m)
 
+        # Ensure a base project directory to isolate runs per post
+        try:
+            base_run_dir = os.path.join(DATA_DIR, ".ta_runs", str(pid))
+            os.makedirs(base_run_dir, exist_ok=True)
+        except Exception:
+            base_run_dir = None
+
+        # If caller didn't specify a project_dir, set a stable base to avoid global collisions
+        if "project_dir" not in cfg and base_run_dir:
+            cfg["project_dir"] = os.path.join(base_run_dir, "base")
+
         for t in tickers:
             yield _sse({"type": "ticker-start", "ticker": t})
-            try:
-                ta = TradingAgentsGraph(selected_analysts=selected_analysts, debug=debug, config=cfg)
-                init_state = ta.propagator.create_initial_state(t, date_str)
-                args = ta.propagator.get_graph_args()
-                final_state = None
-                last_decision_seen = None  # fallback if final_state lacks decision
+            attempt = 1
+            local_cfg = dict(cfg)
+            while attempt <= 2:
+                try:
+                    # On retry, use a unique project_dir to avoid vector DB collection collisions
+                    if attempt > 1 and base_run_dir:
+                        try:
+                            run_ns = os.path.join(base_run_dir, t)
+                            os.makedirs(run_ns, exist_ok=True)
+                            local_cfg = dict(local_cfg)
+                            local_cfg["project_dir"] = os.path.join(run_ns, f"run-{int(time.time())}")
+                            os.makedirs(local_cfg["project_dir"], exist_ok=True)
+                        except Exception:
+                            pass
 
-                def _derive_decision_from_text(text: str) -> str | None:
-                    try:
-                        txt = (text or "").lower()
-                        if not txt:
-                            return None
-                        # Prefer lines that look like a final decision
-                        if "final" in txt or "proposal" in txt or "decision" in txt:
+                    ta = TradingAgentsGraph(selected_analysts=selected_analysts, debug=debug, config=local_cfg)
+                    init_state = ta.propagator.create_initial_state(t, date_str)
+                    args = ta.propagator.get_graph_args()
+                    final_state = None
+                    last_decision_seen = None  # fallback if final_state lacks decision
+
+                    def _derive_decision_from_text(text: str) -> str | None:
+                        try:
+                            txt = (text or "").lower()
+                            if not txt:
+                                return None
+                            # Prefer lines that look like a final decision
+                            if "final" in txt or "proposal" in txt or "decision" in txt:
+                                if "buy" in txt:
+                                    return "Buy"
+                                if "sell" in txt:
+                                    return "Sell"
+                                if "hold" in txt:
+                                    return "Hold"
+                            # Fallback: any clear buy/sell/hold mention
                             if "buy" in txt:
                                 return "Buy"
                             if "sell" in txt:
                                 return "Sell"
                             if "hold" in txt:
                                 return "Hold"
-                        # Fallback: any clear buy/sell/hold mention
-                        if "buy" in txt:
-                            return "Buy"
-                        if "sell" in txt:
-                            return "Sell"
-                        if "hold" in txt:
-                            return "Hold"
-                        return None
-                    except Exception:
-                        return None
-                for chunk in ta.graph.stream(init_state, **args):
-                    if not chunk.get("messages"):
+                            return None
+                        except Exception:
+                            return None
+                    for chunk in ta.graph.stream(init_state, **args):
+                        if not chunk.get("messages"):
+                            continue
+                        message = chunk["messages"][-1]
+                        content = getattr(message, "content", None)
+                        if content and str(content).strip():
+                            text = str(content).strip()
+                            log_line(f"{t}: {text}")
+                            # Remember the last seen explicit decision cue
+                            d = _derive_decision_from_text(text)
+                            if d:
+                                last_decision_seen = d
+                            yield _sse({"type": "log", "ticker": t, "message": text})
+                        final_state = chunk
+
+                    if not final_state:
+                        raise RuntimeError("No final state produced by graph.stream")
+
+                    # Decide
+                    decision = None
+                    if final_state and final_state.get("final_trade_decision"):
+                        try:
+                            decision = ta.process_signal(final_state["final_trade_decision"]) or ""
+                        except Exception:
+                            decision = str(final_state.get("final_trade_decision") or "")
+                    # Fallback to parsed streamed text if no final state decision
+                    if not decision:
+                        decision = last_decision_seen or "Hold"
+                    norm = ("Buy" if "buy" in str(decision).lower() else "Sell" if "sell" in str(decision).lower() else "Hold")
+                    signals = {
+                        "final_trade_decision": final_state.get("final_trade_decision"),
+                        "investment_plan": final_state.get("investment_plan"),
+                        "judge_decision_invest": (final_state.get("investment_debate_state") or {}).get("judge_decision"),
+                        "judge_decision_risk": (final_state.get("risk_debate_state") or {}).get("judge_decision"),
+                    }
+
+                    def upd(pp):
+                        init_analysis(pp)
+                        per = pp["analysis"].setdefault("per_ticker", {})
+                        per[t] = {"suggestion": norm, "signals": signals}
+                        pp["analysis"]["updatedAt"] = _utcnow_iso()
+                    _update_post(pid, upd)
+
+                    # Update snapshot for this ticker
+                    cur = get_latest_price(t)
+                    buy = None
+                    if isinstance(p.get("purchases"), dict):
+                        buy = (p.get("purchases") or {}).get(t)
+                    elif isinstance(p.get("purchases"), (int, float)):
+                        buy = p.get("purchases")
+                    pct = percent_change(buy, cur) if buy is not None else None
+
+                    def upd_snap(pp):
+                        pp.setdefault("snapshot", {})[t] = {"current": cur, "pct": pct}
+                        pp["updatedAt"] = _utcnow_iso()
+                    _update_post(pid, upd_snap)
+
+                    yield _sse({"type": "ticker-done", "ticker": t, "suggestion": norm, "current": cur, "pct": pct})
+                    break  # success, stop retry loop
+                except Exception as e:
+                    msg = str(e)
+                    # If memory collection exists error, retry once with a fresh namespace
+                    if ("already exists" in msg and "memory" in msg.lower()) and attempt == 1:
+                        log_line(f"{t}: warning Memory collection already exists; retrying with a fresh memory namespace.")
+                        try:
+                            yield _sse({"type": "log", "ticker": t, "message": "Memory exists; retrying with fresh namespace."})
+                        except Exception:
+                            pass
+                        attempt += 1
                         continue
-                    message = chunk["messages"][-1]
-                    content = getattr(message, "content", None)
-                    if content and str(content).strip():
-                        text = str(content).strip()
-                        log_line(f"{t}: {text}")
-                        # Remember the last seen explicit decision cue
-                        d = _derive_decision_from_text(text)
-                        if d:
-                            last_decision_seen = d
-                        yield _sse({"type": "log", "ticker": t, "message": text})
-                    final_state = chunk
-
-                if not final_state:
-                    raise RuntimeError("No final state produced by graph.stream")
-
-                # Decide
-                decision = None
-                if final_state and final_state.get("final_trade_decision"):
-                    try:
-                        decision = ta.process_signal(final_state["final_trade_decision"]) or ""
-                    except Exception:
-                        decision = str(final_state.get("final_trade_decision") or "")
-                # Fallback to parsed streamed text if no final state decision
-                if not decision:
-                    decision = last_decision_seen or "Hold"
-                norm = ("Buy" if "buy" in str(decision).lower() else "Sell" if "sell" in str(decision).lower() else "Hold")
-                signals = {
-                    "final_trade_decision": final_state.get("final_trade_decision"),
-                    "investment_plan": final_state.get("investment_plan"),
-                    "judge_decision_invest": (final_state.get("investment_debate_state") or {}).get("judge_decision"),
-                    "judge_decision_risk": (final_state.get("risk_debate_state") or {}).get("judge_decision"),
-                }
-
-                def upd(pp):
-                    init_analysis(pp)
-                    per = pp["analysis"].setdefault("per_ticker", {})
-                    per[t] = {"suggestion": norm, "signals": signals}
-                    pp["analysis"]["updatedAt"] = _utcnow_iso()
-                _update_post(pid, upd)
-
-                # Update snapshot for this ticker
-                cur = get_latest_price(t)
-                buy = None
-                if isinstance(p.get("purchases"), dict):
-                    buy = (p.get("purchases") or {}).get(t)
-                elif isinstance(p.get("purchases"), (int, float)):
-                    buy = p.get("purchases")
-                pct = percent_change(buy, cur) if buy is not None else None
-
-                def upd_snap(pp):
-                    pp.setdefault("snapshot", {})[t] = {"current": cur, "pct": pct}
-                    pp["updatedAt"] = _utcnow_iso()
-                _update_post(pid, upd_snap)
-
-                yield _sse({"type": "ticker-done", "ticker": t, "suggestion": norm, "current": cur, "pct": pct})
-            except Exception as e:
-                # Handle known TA memory collection errors gracefully
-                msg = str(e)
-                if "already exists" in msg and "memory" in msg.lower():
-                    log_line(f"{t}: warning Memory collection already exists; reusing existing memory.")
-                else:
+                    # Non-retryable or second failure: record error and emit ticker-error
                     log_line(f"{t}: error {e}", level="error")
-                def upd_err(pp):
-                    init_analysis(pp)
-                    per = pp["analysis"].setdefault("per_ticker", {})
-                    per[t] = {"suggestion": per.get(t, {}).get("suggestion", "Hold"), "signals": {"error": str(e)}}
-                    pp["analysis"]["updatedAt"] = _utcnow_iso()
-                _update_post(pid, upd_err)
-                yield _sse({"type": "ticker-error", "ticker": t, "error": str(e)})
+                    def upd_err(pp):
+                        init_analysis(pp)
+                        per = pp["analysis"].setdefault("per_ticker", {})
+                        per[t] = {"suggestion": per.get(t, {}).get("suggestion", "Hold"), "signals": {"error": str(e)}}
+                        pp["analysis"]["updatedAt"] = _utcnow_iso()
+                    _update_post(pid, upd_err)
+                    try:
+                        yield _sse({"type": "ticker-error", "ticker": t, "error": str(e)})
+                    except Exception:
+                        pass
+                    break
 
         # Build final summary
         posts_now = _read()
@@ -658,16 +1121,15 @@ def analyze_post_stream(pid):
 @app.post("/api/analyze-all")
 def analyze_all():
     posts = _read()
-    out = []
-    for p in posts:
-        try:
-            pid = p["id"]
-            # Reuse the single analyze route logic
-            with app.test_request_context():
-                out.append(json.loads(analyze_post(pid).response[0]))
-        except Exception as e:
-            out.append({"id": p.get("id"), "error": str(e)})
-    return jsonify(out)
+    with JOB_LOCK:
+        for p in posts:
+            pid = str(p.get("id"))
+            # Skip if already running or queued
+            if pid == CURRENT_JOB.get("pid") or pid in JOB_QUEUE:
+                continue
+            JOB_QUEUE.append(pid)
+            JOB_STATE[pid] = 'queued'
+    return jsonify(_get_job_states())
 
 @app.get("/api/chart")
 def chart():
@@ -726,6 +1188,42 @@ def start_regen_thread():
     t = threading.Thread(target=auto_regen_loop, daemon=True)
     t.start()
 
+def job_worker_loop():
+    while True:
+        pid = None
+        with JOB_LOCK:
+            if CURRENT_JOB.get("pid") is None and JOB_QUEUE:
+                pid = JOB_QUEUE.pop(0)
+                CURRENT_JOB["pid"] = pid
+                JOB_STATE[pid] = 'running'
+        # Clear any existing report when job starts successfully
+        if pid:
+            def _clear_report(pp):
+                ana = pp.get("analysis") or {}
+                if not isinstance(ana, dict):
+                    ana = {}
+                ana["report"] = ""
+                ana.setdefault("per_ticker", {})
+                ana["updatedAt"] = _utcnow_iso()
+                pp["analysis"] = ana
+                pp["updatedAt"] = _utcnow_iso()
+            _update_post(pid, _clear_report)
+        if not pid:
+            time.sleep(0.2)
+            continue
+        try:
+            perform_analysis(pid)
+            # set done unless stopped or error already set
+            st = JOB_STATE.get(pid)
+            if st not in ('stopped','error'):
+                _set_state(pid, 'done')
+        except Exception:
+            _set_state(pid, 'error')
+        finally:
+            with JOB_LOCK:
+                if CURRENT_JOB.get("pid") == pid:
+                    CURRENT_JOB["pid"] = None
+
 # Stock page route
 @app.route('/stock')
 def serve_stock():
@@ -737,4 +1235,5 @@ def serve_stock_html():
 
 if __name__ == "__main__":
     start_regen_thread()
+    threading.Thread(target=job_worker_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=5055, debug=True)

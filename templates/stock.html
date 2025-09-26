@@ -16,6 +16,23 @@
             document.head.appendChild(l);
         })();
     </script>
+    <script>
+        // Load tiny Markdown renderer and sanitizer when served over http(s)
+        (function(){
+            var hasServer = location.protocol === 'http:' || location.protocol === 'https:';
+            if (!hasServer) return;
+            try {
+                var s1 = document.createElement('script');
+                s1.src = 'https://cdn.jsdelivr.net/npm/marked/marked.min.js';
+                s1.defer = true;
+                document.head.appendChild(s1);
+                var s2 = document.createElement('script');
+                s2.src = 'https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js';
+                s2.defer = true;
+                document.head.appendChild(s2);
+            } catch {}
+        })();
+    </script>
 </head>
 
 <body>

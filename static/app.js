@@ -48,6 +48,9 @@ let currentDetailId = null;
 let STREAMS = new Map(); // pid -> EventSource
 let REFRESHING = new Set(); // dedupe snapshot refresh calls
 let LAST_REFRESH = new Map(); // pid -> timestamp ms
+let JOB_STATUS = { running: null, queue: [], states: {} }; // queue status snapshot
+// Global touch DnD state (single listeners to avoid duplicates)
+let TOUCH_DND = { active: false, row: null, tbody: null };
 
 // --- utils
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -106,6 +109,14 @@ async function loadConfig() {
     }
 }
 
+async function loadQueueStatus() {
+    try {
+        JOB_STATUS = await api('/api/queue/status');
+    } catch (e) {
+        JOB_STATUS = { running: null, queue: [], states: {} };
+    }
+}
+
 async function loadPosts() {
     POSTS = await api("/api/stocks");
     // Detect if server order differs from time-sorted order; if so, treat as custom order
@@ -115,6 +126,7 @@ async function loadPosts() {
         if (!same) HAS_CUSTOM_ORDER = true;
     } catch {}
     // if server returned posts in a specific order, respect it; HAS_CUSTOM_ORDER persists during session
+    await loadQueueStatus();
     renderFeed();
 }
 
@@ -172,6 +184,21 @@ function runAnalysisStream(id) {
             const data = JSON.parse(e.data || '{}');
             if (!data || currentDetailId !== id) return; // only update visible entry
             if (data.type === 'start') {
+                // Ensure raw log area exists; if currently in Markdown mode, switch to raw for live logs
+                (function ensureRawArea(){
+                    const pre = logElm();
+                    if (pre) return;
+                    const host = document.getElementById('reportHost');
+                    if (!host) return;
+                    const text = host.textContent || '';
+                    host.className = '';
+                    host.innerHTML = `<pre id="dReport" class="log" style="white-space:pre-wrap"></pre>`;
+                    const p = document.getElementById('dReport');
+                    if (p) p.textContent = text;
+                    try { host.__mode = 'raw'; } catch {}
+                    const tgl = document.getElementById('toggleMdBtn');
+                    if (tgl) tgl.textContent = 'View: Markdown';
+                })();
                 // Do not clear existing report; just note the new stream start
                 appendLog('Streaming started…');
             } else if (data.type === 'log') {
@@ -267,16 +294,40 @@ function renderFeed() {
         const primary = (p.tickers || [])[0] || "";
         const snap = (p.snapshot || {})[primary] || {};
         const purchase = (p.purchases || {})[primary];
-        const suggestion = rowSuggestion(p, primary);
+        // Prefer live suggestion from queue status (primary ticker) if available
+        let suggestion = rowSuggestion(p, primary);
+        const livePrim = JOB_STATUS.primary_suggestions?.[p.id];
+        if (livePrim && livePrim.ticker === primary && livePrim.suggestion) {
+            suggestion = livePrim.suggestion;
+        }
 
-        const tr = document.createElement("tr");
+                const tr = document.createElement("tr");
         tr.className = `rowAccent ${classBySuggestion(suggestion)}`;
         tr.setAttribute('data-id', p.id);
-        tr.innerHTML = `
+                const status = JOB_STATUS.states?.[p.id] || 'idle';
+                // If state was 'done' but is now queued/running again, override local status display
+                if ((status === 'done') && (JOB_STATUS.running === p.id || JOB_STATUS.queue.includes(p.id))) {
+                    // show running/queued based on queue data
+                    if (JOB_STATUS.running === p.id) {
+                        // running
+                    } else {
+                        // queued; treat as queued
+                    }
+                }
+                const statusBadge = (function(){
+                    if (status === 'running') return '<span class="pill status-running" title="Analysis running">⏳ running</span>';
+                    if (status === 'queued') return '<span class="pill status-queued" title="In queue">🕒 queued</span>';
+                    if (status === 'stopped') return '<span class="pill status-stopped" title="Stopped">■ stopped</span>';
+                    if (status === 'error') return '<span class="pill status-error" title="Error">⚠ error</span>';
+                    if (status === 'done') return '<span class="pill status-done" title="Completed">✓ done</span>';
+                        return '';
+                })();
+                tr.innerHTML = `
       <td class="drag-cell"><span class="drag-handle" title="Drag to reorder" aria-label="Drag to reorder" draggable="false">⋮⋮</span></td>
       <td>
         <div style="font-weight:600">${escapeHtml(p.title || "Untitled")}</div>
-        <div class="muted">${p.description ? escapeHtml(p.description.slice(0, 100)) : ""}</div>
+                <div class="muted">${p.description ? escapeHtml(p.description.slice(0, 100)) : ""}</div>
+                <div class="inline" style="margin-top:4px; gap:6px">${statusBadge}</div>
       </td>
       <td>${(p.tickers || []).map(t => `<span class="tickerpill">${t}</span>`).join("")}</td>
       <td style="text-align:right">${fmtMoney(purchase)}</td>
@@ -312,7 +363,7 @@ function renderFeed() {
                 if (window._dragGhost) { try { window._dragGhost.remove(); } catch {} window._dragGhost = null; }
             });
         }
-        // Row-level delegates for visual indicator and live reflow while dragging
+        // Row-level delegates for visual indicator and live reflow while dragging (mouse)
         tr.addEventListener('dragover', (e) => {
             e.preventDefault();
             const draggingRow = tbody.querySelector('tr.dragging');
@@ -347,8 +398,18 @@ function renderFeed() {
                 console.warn('Failed to save order', err);
             }
         });
+        // Touch-based reordering fallback for phones (no native drag & drop)
+        handle?.addEventListener('touchstart', (e) => {
+            const t = e.touches[0];
+            TOUCH_DND.active = true; dragStarted = true;
+            TOUCH_DND.row = tr; TOUCH_DND.tbody = tbody;
+            tr.classList.add('dragging');
+            e.preventDefault();
+        }, { passive: false });
         tr.addEventListener("click", (ev) => {
-            if (dragStarted) return; // ignore click if it was a drag
+            // ignore click if it was a drag (mouse) or just ended touch DnD
+            if (dragStarted) return;
+            if (window.__touchDndJustEnded && (Date.now() - window.__touchDndJustEnded) < 600) return;
             // ignore clicks on handle that might be slight
             if (ev.target && ev.target.closest('.drag-handle')) return;
             openDetail(p.id);
@@ -471,9 +532,12 @@ function openDetail(id) {
         <pre id="dSummary" class="pre-card" style="white-space:pre-wrap;margin-bottom:10px">${escapeHtml(summary)}</pre>
         <div class="inline" style="align-items:center; gap:8px; justify-content:space-between">
             <h3 style="margin:0">Report</h3>
-            <button id="copyReportBtn" class="ghost" title="Copy report to clipboard">Copy</button>
+            <div class="inline" style="gap:6px">
+                <button id="toggleMdBtn" class="ghost" title="Toggle Markdown rendering">View: Markdown</button>
+                <button id="copyReportBtn" class="ghost" title="Copy report to clipboard">Copy</button>
+            </div>
         </div>
-        <pre id="dReport" class="log" style="white-space:pre-wrap">${escapeHtml(report)}</pre>
+        <div id="reportHost"></div>
     `;
 
         const meta = document.createElement("div");
@@ -491,6 +555,48 @@ function openDetail(id) {
     els.dContent.innerHTML = "";
     els.dContent.appendChild(wrap);
 
+    // Report rendering host setup (Markdown or Raw)
+    const reportHost = document.getElementById('reportHost');
+    const copyBtn = document.getElementById('copyReportBtn');
+    const toggleBtn = document.getElementById('toggleMdBtn');
+    // state flag on element
+    reportHost.__mode = reportHost.__mode || 'md'; // 'md' | 'raw'
+    function renderReport(content) {
+        const mode = reportHost.__mode;
+        if (mode === 'md' && window.marked && window.DOMPurify) {
+            try {
+                const dirty = String(content || '');
+                const html = window.marked.parse(dirty);
+                const safe = window.DOMPurify.sanitize(html, { USE_PROFILES: { html: true, svg: false, svgFilters: false, mathMl: false } });
+                reportHost.className = 'md';
+                reportHost.innerHTML = safe || '<div class="muted">(empty)</div>';
+            } catch {
+                reportHost.className = '';
+                reportHost.innerHTML = `<pre id="dReport" class="log" style="white-space:pre-wrap">${escapeHtml(String(content||''))}</pre>`;
+            }
+        } else {
+            reportHost.className = '';
+            reportHost.innerHTML = `<pre id="dReport" class="log" style="white-space:pre-wrap">${escapeHtml(String(content||''))}</pre>`;
+        }
+    }
+    renderReport(report);
+
+    if (toggleBtn) {
+        toggleBtn.onclick = () => {
+            reportHost.__mode = (reportHost.__mode === 'md') ? 'raw' : 'md';
+            toggleBtn.textContent = 'View: ' + (reportHost.__mode === 'md' ? 'Markdown' : 'Raw');
+            const text = getCurrentReportText();
+            renderReport(text);
+        };
+    }
+
+    function getCurrentReportText() {
+        // Prefer fresh value from POSTS cache
+        const cur = POSTS.find(x => x.id === id);
+        const txt = (cur && cur.analysis && (cur.analysis.report || cur.analysis.summary)) ? (cur.analysis.report || cur.analysis.summary) : report;
+        return String(txt || '');
+    }
+
     const periodSel = $("#cPeriod", chart);
     const intervalSel = $("#cInterval", chart);
     periodSel.addEventListener("change", () => loadChartInto((window._activeTicker || primary)));
@@ -505,8 +611,39 @@ function openDetail(id) {
     loadChartInto(primary);
     els.detailDlg.showModal();
 
-    // Prefer streaming analysis for live updates; fallback remains available if needed
-    els.dAnalyze.onclick = () => runAnalysisStream(id);
+    // Analyze button uses queue semantics
+    function refreshAnalyzeButton() {
+        const st = JOB_STATUS.states?.[id] || 'idle';
+        els.dAnalyze.disabled = false;
+        els.dAnalyze.classList.remove('state-queued','state-running','state-stopped','primary');
+        if (st === 'running') { els.dAnalyze.textContent = 'Stop'; els.dAnalyze.classList.add('state-running'); }
+        else if (st === 'queued') { els.dAnalyze.textContent = 'Cancel from queue'; els.dAnalyze.classList.add('state-queued'); }
+        else if (st === 'stopped') { els.dAnalyze.textContent = 'Analyze (queue)'; els.dAnalyze.classList.add('state-stopped'); }
+        else { els.dAnalyze.textContent = 'Analyze (queue)'; els.dAnalyze.classList.add('primary'); }
+    }
+    refreshAnalyzeButton();
+    els.dAnalyze.onclick = async () => {
+        const st = JOB_STATUS.states?.[id] || 'idle';
+        if (st === 'running' || st === 'queued') {
+            try { await api(`/api/queue/stop/${encodeURIComponent(id)}`, { method: 'POST' }); } catch {}
+        } else {
+            try {
+                await api(`/api/queue/${encodeURIComponent(id)}`, { method: 'POST' });
+                // Immediately clear report UI so user sees fresh start
+                const host = document.getElementById('reportHost');
+                if (host) {
+                    host.className = '';
+                    host.innerHTML = `<pre id="dReport" class="log" style="white-space:pre-wrap"></pre>`;
+                    host.__mode = 'raw';
+                    const tgl = document.getElementById('toggleMdBtn');
+                    if (tgl) tgl.textContent = 'View: Markdown';
+                }
+            } catch {}
+        }
+        await loadQueueStatus();
+        refreshAnalyzeButton();
+        renderFeed();
+    };
     els.dEdit.onclick = () => openEdit(p);
     els.dDelete.onclick = () => removePost(id);
 
@@ -527,17 +664,14 @@ function openDetail(id) {
         }
     }).catch(() => {});
 
-    // Wire copy button
-    const copyBtn = document.getElementById('copyReportBtn');
+    // Wire copy button to copy raw markdown (preferred for sharing)
     if (copyBtn) {
         copyBtn.onclick = async () => {
-            const pre = document.getElementById('dReport');
-            const text = pre ? pre.textContent : '';
+            const text = getCurrentReportText();
             try {
                 if (navigator.clipboard && navigator.clipboard.writeText) {
                     await navigator.clipboard.writeText(text);
                 } else {
-                    // Fallback copy
                     const ta = document.createElement('textarea');
                     ta.value = text; document.body.appendChild(ta); ta.select();
                     document.execCommand('copy'); document.body.removeChild(ta);
@@ -964,6 +1098,136 @@ els.fabAdd.addEventListener("click", openNew);
             POSTS = POSTS.slice().sort((a, b) => (b.updatedAt || b.createdAt || '').localeCompare(a.updatedAt || a.createdAt || ''));
             renderFeed();
             showToast('Order reset');
+        });
+    }
+    // Queue SSE stream (terminal events) + debounced refresh logic to replace frequent polling
+    (function initQueueStream(){
+        let es = null;
+        let reconnectDelay = 2000; // backoff up to ~30s
+        let refreshTimer = null;
+        let queuedRefresh = false;
+
+        async function applySnapshotRefresh(triggerSource){
+            // One-shot fetch of full status + targeted detail refresh
+            try {
+                await loadQueueStatus();
+                renderFeed();
+                if (currentDetailId) {
+                    try {
+                        const p = await api(`/api/stocks/${encodeURIComponent(currentDetailId)}`);
+                        const idx = POSTS.findIndex(x => x.id === currentDetailId);
+                        if (idx >= 0) POSTS[idx] = p; else POSTS.push(p);
+                        const host = document.getElementById('reportHost');
+                        if (host) {
+                            const txt = (p.analysis && (p.analysis.report || p.analysis.summary)) ? (p.analysis.report || p.analysis.summary) : '';
+                            if (host.__mode === 'md' && window.marked && window.DOMPurify) {
+                                try {
+                                    const html = window.DOMPurify.sanitize(window.marked.parse(String(txt || '')));
+                                    host.className = 'md';
+                                    host.innerHTML = html;
+                                } catch {}
+                            } else {
+                                host.className = '';
+                                host.innerHTML = `<pre id="dReport" class="log" style="white-space:pre-wrap">${escapeHtml(String(txt||''))}</pre>`;
+                            }
+                        }
+                        const snapHost = document.getElementById('dSnapshot');
+                        if (snapHost) snapHost.innerHTML = renderSnapshotTable(p);
+                        // analyze button state
+                        const btn = document.getElementById('dAnalyze');
+                        if (btn) {
+                            const st = JOB_STATUS.states?.[currentDetailId] || 'idle';
+                            if (st === 'running') btn.textContent = 'Stop';
+                            else if (st === 'queued') btn.textContent = 'Cancel from queue';
+                            else btn.textContent = 'Analyze (queue)';
+                        }
+                    } catch {}
+                }
+            } catch (e) {
+                console.warn('Queue snapshot refresh failed', e);
+            }
+        }
+
+        function scheduleSnapshotRefresh(){
+            if (queuedRefresh) return;
+            queuedRefresh = true;
+            clearTimeout(refreshTimer);
+            refreshTimer = setTimeout(() => {
+                queuedRefresh = false;
+                applySnapshotRefresh('debounce');
+            }, 400); // debounce bursts of terminal events
+        }
+
+        function connect(){
+            if (es) { try { es.close(); } catch {} }
+            es = new EventSource(API_BASE + '/api/queue/stream');
+            es.onopen = () => { reconnectDelay = 2000; /* initial or successful reconnect */ };
+            es.onmessage = (e) => {
+                if (!e.data) return;
+                // Comments (keep-alive) start with ':' and are delivered via onmessage in some browsers with empty data
+                try {
+                    const data = JSON.parse(e.data);
+                    if (data && data.type === 'state' && data.pid) {
+                        // Update local states map optimistically
+                        JOB_STATUS.states = JOB_STATUS.states || {};
+                        JOB_STATUS.states[data.pid] = data.state;
+                        // A terminal event means possible change in running/queue ordering; schedule full snapshot
+                        scheduleSnapshotRefresh();
+                    }
+                } catch { /* ignore parse for keep-alives */ }
+            };
+            es.onerror = () => {
+                try { es.close(); } catch {}
+                es = null;
+                // Attempt reconnect with backoff
+                setTimeout(connect, reconnectDelay);
+                reconnectDelay = Math.min(reconnectDelay * 1.7, 30000);
+            };
+        }
+
+        // Initial snapshot (already loaded via loadPosts -> loadQueueStatus) but ensure recency
+        applySnapshotRefresh('initial');
+        connect();
+        // Expose for debugging
+        window.__queueStream = () => es;
+    })();
+    // One-time global touch DnD handlers
+    if (!window.__touchDndWired) {
+        window.__touchDndWired = true;
+        window.addEventListener('touchmove', (e) => {
+            if (!TOUCH_DND.active || !TOUCH_DND.row || !TOUCH_DND.tbody) return;
+            e.preventDefault();
+            const t = e.touches[0];
+            const tbody = TOUCH_DND.tbody; const row = TOUCH_DND.row;
+            const rows = Array.from(tbody.querySelectorAll('tr'));
+            const target = rows.find(r => {
+                const rect = r.getBoundingClientRect();
+                return t.clientY >= rect.top && t.clientY <= rect.bottom;
+            });
+            if (!target || target === row) return;
+            const rect = target.getBoundingClientRect();
+            const before = (t.clientY - rect.top) < rect.height / 2;
+            if (before) tbody.insertBefore(row, target); else tbody.insertBefore(row, target.nextSibling);
+        }, { passive: false });
+        window.addEventListener('touchend', async () => {
+            if (!TOUCH_DND.active || !TOUCH_DND.tbody) return;
+            const tbody = TOUCH_DND.tbody; const row = TOUCH_DND.row;
+            TOUCH_DND.active = false; TOUCH_DND.row = null; TOUCH_DND.tbody = null;
+            window.__touchDndJustEnded = Date.now();
+            if (row) row.classList.remove('dragging');
+            tbody.querySelectorAll('tr').forEach(r => r.classList.remove('drop-before','drop-after'));
+            // Persist new order
+            const newOrder = Array.from(tbody.querySelectorAll('tr')).map(r => r.getAttribute('data-id')).filter(Boolean);
+            try {
+                await api('/api/stocks/reorder', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ order: newOrder }) });
+                HAS_CUSTOM_ORDER = true;
+                try { localStorage.setItem('feed:customOrder', '1'); } catch {}
+                const byId = new Map(POSTS.map(x => [x.id, x]));
+                POSTS = newOrder.map(id => byId.get(id)).filter(Boolean).concat(POSTS.filter(x => !newOrder.includes(x.id)));
+                showToast('Order saved');
+            } catch (err) {
+                console.warn('Failed to save order', err);
+            }
         });
     }
 })();
